@@ -3,20 +3,34 @@
 
 import glob as globlib, json, os, re, subprocess, urllib.request
 
-# APIキーが設定されている場合はOpenRouter、なければAnthropicを使用
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-API_URL = "https://openrouter.ai/api/v1/messages" if OPENROUTER_KEY else "https://api.anthropic.com/v1/messages"
-# 環境変数MODELで上書き可能。未設定時はOpenRouter/Anthropicそれぞれのデフォルトモデルを使用
-MODEL = os.environ.get("MODEL", "anthropic/claude-opus-4.5" if OPENROUTER_KEY else "claude-opus-4-5")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-# ANSIエスケープコード（ターミナル装飾用）
+if OPENROUTER_KEY:
+    API_URL = "https://openrouter.ai/api/v1/chat/completions"
+    API_KEY = OPENROUTER_KEY
+    DEFAULT_MODEL = "anthropic/claude-opus-4.5"
+    PROVIDER = "OpenRouter"
+    USE_OPENAI = True
+elif OPENAI_KEY:
+    API_URL = "https://api.openai.com/v1/chat/completions"
+    API_KEY = OPENAI_KEY
+    DEFAULT_MODEL = "gpt-4o"
+    PROVIDER = "OpenAI"
+    USE_OPENAI = True
+else:
+    API_URL = "https://api.anthropic.com/v1/messages"
+    API_KEY = ANTHROPIC_KEY or ""
+    DEFAULT_MODEL = "claude-opus-4-5"
+    PROVIDER = "Anthropic"
+    USE_OPENAI = False
+
+MODEL = os.environ.get("MODEL", DEFAULT_MODEL)
+
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, YELLOW, RED = (
-    "\033[34m",
-    "\033[36m",
-    "\033[32m",
-    "\033[33m",
-    "\033[31m",
+    "\033[34m", "\033[36m", "\033[32m", "\033[33m", "\033[31m",
 )
 
 
@@ -24,7 +38,6 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 
 
 def read(args):
-    # ファイルを行番号付きで読み込む。offset/limitで範囲指定可能
     lines = open(args["path"]).readlines()
     offset = args.get("offset", 0)
     limit = args.get("limit", len(lines))
@@ -33,20 +46,17 @@ def read(args):
 
 
 def write(args):
-    # ファイルに内容を書き込む（上書き）
     with open(args["path"], "w") as f:
         f.write(args["content"])
     return "ok"
 
 
 def edit(args):
-    # ファイル内の old 文字列を new 文字列に置換する
     text = open(args["path"]).read()
     old, new = args["old"], args["new"]
     if old not in text:
         return "error: old_string not found"
     count = text.count(old)
-    # all=true でない場合、old が複数存在するとエラー（誤置換防止）
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times, must be unique (use all=true)"
     replacement = (
@@ -58,7 +68,6 @@ def edit(args):
 
 
 def glob(args):
-    # パターンに一致するファイルを更新日時降順で列挙する
     pattern = (args.get("path", ".") + "/" + args["pat"]).replace("//", "/")
     files = globlib.glob(pattern, recursive=True)
     files = sorted(
@@ -70,7 +79,6 @@ def glob(args):
 
 
 def grep(args):
-    # 正規表現でファイル群を検索し、マッチした行を最大50件返す
     pattern = re.compile(args["pat"])
     hits = []
     for filepath in globlib.glob(args.get("path", ".") + "/**", recursive=True):
@@ -84,7 +92,6 @@ def grep(args):
 
 
 def bash(args):
-    # シェルコマンドをリアルタイムストリーミングで実行し、出力を返す
     proc = subprocess.Popen(
         args["cmd"], shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -143,15 +150,13 @@ TOOLS = {
 
 
 def run_tool(name, args):
-    # ツール名でディスパッチし、エラーは文字列で返す
     try:
         return TOOLS[name][2](args)
     except Exception as err:
         return f"error: {err}"
 
 
-def make_schema():
-    # TOOLS定義からAnthropicのtool_use形式のJSONスキーマを生成する
+def _param_schemas():
     result = []
     for name, (description, params, _fn) in TOOLS.items():
         properties = {}
@@ -164,56 +169,77 @@ def make_schema():
             }
             if not is_optional:
                 required.append(param_name)
-        result.append(
-            {
-                "name": name,
-                "description": description,
-                "input_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
-            }
-        )
+        schema = {"type": "object", "properties": properties, "required": required}
+        result.append((name, description, schema))
     return result
 
 
+def make_schema():
+    schemas = _param_schemas()
+    if USE_OPENAI:
+        # OpenAI互換: {"type": "function", "function": {...}}
+        return [
+            {"type": "function", "function": {"name": n, "description": d, "parameters": s}}
+            for n, d, s in schemas
+        ]
+    # Anthropicネイティブ: {"name": ..., "input_schema": {...}}
+    return [{"name": n, "description": d, "input_schema": s} for n, d, s in schemas]
+
+
 def call_api(messages, system_prompt):
-    # APIにリクエストを送信し、レスポンスをJSONで返す
-    request = urllib.request.Request(
-        API_URL,
-        data=json.dumps(
-            {
-                "model": MODEL,
-                "max_tokens": 8192,
-                "system": system_prompt,
-                "messages": messages,
-                "tools": make_schema(),
-            }
-        ).encode(),
-        headers={
+    if USE_OPENAI:
+        body = {
+            "model": MODEL,
+            "max_tokens": 8192,
+            "messages": [{"role": "system", "content": system_prompt}] + messages,
+            "tools": make_schema(),
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+        }
+    else:
+        body = {
+            "model": MODEL,
+            "max_tokens": 8192,
+            "system": system_prompt,
+            "messages": messages,
+            "tools": make_schema(),
+        }
+        headers = {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
-            # OpenRouterはBearerトークン、AnthropicはAPIキーヘッダーを使用
-            **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": os.environ.get("ANTHROPIC_API_KEY", "")}),
-        },
+            "x-api-key": API_KEY,
+        }
+    request = urllib.request.Request(
+        API_URL,
+        data=json.dumps(body).encode(),
+        headers=headers,
     )
     response = urllib.request.urlopen(request)
     return json.loads(response.read())
 
 
 def separator():
-    # ターミナル幅に合わせた区切り線を返す（最大80文字）
     return f"{DIM}{'─' * min(os.get_terminal_size().columns, 80)}{RESET}"
 
 
 def render_markdown(text):
-    # **太字** をANSIボールドに変換する簡易Markdownレンダラー
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
 
 
+def _result_preview(result):
+    lines = result.split("\n")
+    preview = lines[0][:60]
+    if len(lines) > 1:
+        preview += f" ... +{len(lines) - 1} lines"
+    elif len(lines[0]) > 60:
+        preview += "..."
+    return preview
+
+
 def main():
-    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
+    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({PROVIDER}) | {os.getcwd()}{RESET}\n")
     messages = []
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
 
@@ -224,10 +250,8 @@ def main():
             print(separator())
             if not user_input:
                 continue
-            # /q または exit で終了
             if user_input in ("/q", "exit"):
                 break
-            # /c で会話履歴をリセット
             if user_input == "/c":
                 messages = []
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
@@ -235,49 +259,69 @@ def main():
 
             messages.append({"role": "user", "content": user_input})
 
-            # エージェントループ: ツール呼び出しがなくなるまでAPIを繰り返し呼ぶ
             while True:
                 response = call_api(messages, system_prompt)
-                content_blocks = response.get("content", [])
-                tool_results = []
 
-                for block in content_blocks:
-                    if block["type"] == "text":
-                        print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
+                if USE_OPENAI:
+                    msg = response["choices"][0]["message"]
+                    text = msg.get("content") or ""
+                    tool_calls = msg.get("tool_calls") or []
 
-                    if block["type"] == "tool_use":
-                        tool_name = block["name"]
-                        tool_args = block["input"]
-                        # 最初の引数の先頭50文字をプレビュー表示
-                        arg_preview = str(list(tool_args.values())[0])[:50]
-                        print(
-                            f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
-                        )
+                    if text:
+                        print(f"\n{CYAN}⏺{RESET} {render_markdown(text)}")
+
+                    assistant_msg = {"role": "assistant", "content": text}
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = tool_calls
+                    messages.append(assistant_msg)
+
+                    if not tool_calls:
+                        break
+
+                    for tc in tool_calls:
+                        tool_name = tc["function"]["name"]
+                        tool_args = json.loads(tc["function"]["arguments"])
+                        arg_preview = str(next(iter(tool_args.values()), ""))[:50]
+                        print(f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})")
 
                         result = run_tool(tool_name, tool_args)
-                        # 結果の先頭60文字をプレビュー表示（複数行の場合は行数も表示）
-                        result_lines = result.split("\n")
-                        preview = result_lines[0][:60]
-                        if len(result_lines) > 1:
-                            preview += f" ... +{len(result_lines) - 1} lines"
-                        elif len(result_lines[0]) > 60:
-                            preview += "..."
-                        print(f"  {DIM}⎿  {preview}{RESET}")
+                        print(f"  {DIM}⎿  {_result_preview(result)}{RESET}")
 
-                        tool_results.append(
-                            {
+                        # OpenAIはtool resultを独立したrole: "tool"メッセージで渡す
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result,
+                        })
+
+                else:  # Anthropicネイティブ
+                    content_blocks = response.get("content", [])
+                    tool_results = []
+
+                    for block in content_blocks:
+                        if block["type"] == "text":
+                            print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
+
+                        if block["type"] == "tool_use":
+                            tool_name = block["name"]
+                            tool_args = block["input"]
+                            arg_preview = str(next(iter(tool_args.values()), ""))[:50]
+                            print(f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})")
+
+                            result = run_tool(tool_name, tool_args)
+                            print(f"  {DIM}⎿  {_result_preview(result)}{RESET}")
+
+                            tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": block["id"],
                                 "content": result,
-                            }
-                        )
+                            })
 
-                messages.append({"role": "assistant", "content": content_blocks})
+                    messages.append({"role": "assistant", "content": content_blocks})
 
-                # ツール呼び出しがなければループ終了
-                if not tool_results:
-                    break
-                messages.append({"role": "user", "content": tool_results})
+                    if not tool_results:
+                        break
+                    messages.append({"role": "user", "content": tool_results})
 
             print()
 
