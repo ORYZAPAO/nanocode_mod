@@ -15,14 +15,23 @@ Built using Claude Code, then used to build itself.
 
 ## Usage
 
+### Anthropic
+
 ```bash
 export ANTHROPIC_API_KEY="your-key"
 python nanocode.py
 ```
 
+### OpenAI
+
+```bash
+export OPENAI_API_KEY="your-key"
+python nanocode.py
+```
+
 ### OpenRouter
 
-Use [OpenRouter](https://openrouter.ai) to access any model:
+Use [OpenRouter](https://openrouter.ai) to access any model via the OpenAI-compatible protocol:
 
 ```bash
 export OPENROUTER_API_KEY="your-key"
@@ -36,6 +45,16 @@ export OPENROUTER_API_KEY="your-key"
 export MODEL="openai/gpt-5.2"
 python nanocode.py
 ```
+
+## API Protocol
+
+| Environment Variable | Provider | Protocol |
+|----------------------|----------|----------|
+| `ANTHROPIC_API_KEY` | Anthropic | Anthropic native (`/v1/messages`) |
+| `OPENAI_API_KEY` | OpenAI | OpenAI-compatible (`/v1/chat/completions`) |
+| `OPENROUTER_API_KEY` | OpenRouter | OpenAI-compatible (`/v1/chat/completions`) |
+
+Priority order when multiple keys are set: `OPENROUTER_API_KEY` > `OPENAI_API_KEY` > `ANTHROPIC_API_KEY`
 
 ## Commands
 
