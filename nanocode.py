@@ -3,11 +3,13 @@
 
 import glob as globlib, json, os, re, subprocess, urllib.request
 
+# APIキーが設定されている場合はOpenRouter、なければAnthropicを使用
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 API_URL = "https://openrouter.ai/api/v1/messages" if OPENROUTER_KEY else "https://api.anthropic.com/v1/messages"
+# 環境変数MODELで上書き可能。未設定時はOpenRouter/Anthropicそれぞれのデフォルトモデルを使用
 MODEL = os.environ.get("MODEL", "anthropic/claude-opus-4.5" if OPENROUTER_KEY else "claude-opus-4-5")
 
-# ANSI colors
+# ANSIエスケープコード（ターミナル装飾用）
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, YELLOW, RED = (
     "\033[34m",
@@ -18,10 +20,11 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 )
 
 
-# --- Tool implementations ---
+# --- ツール実装 ---
 
 
 def read(args):
+    # ファイルを行番号付きで読み込む。offset/limitで範囲指定可能
     lines = open(args["path"]).readlines()
     offset = args.get("offset", 0)
     limit = args.get("limit", len(lines))
@@ -30,17 +33,20 @@ def read(args):
 
 
 def write(args):
+    # ファイルに内容を書き込む（上書き）
     with open(args["path"], "w") as f:
         f.write(args["content"])
     return "ok"
 
 
 def edit(args):
+    # ファイル内の old 文字列を new 文字列に置換する
     text = open(args["path"]).read()
     old, new = args["old"], args["new"]
     if old not in text:
         return "error: old_string not found"
     count = text.count(old)
+    # all=true でない場合、old が複数存在するとエラー（誤置換防止）
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times, must be unique (use all=true)"
     replacement = (
@@ -52,6 +58,7 @@ def edit(args):
 
 
 def glob(args):
+    # パターンに一致するファイルを更新日時降順で列挙する
     pattern = (args.get("path", ".") + "/" + args["pat"]).replace("//", "/")
     files = globlib.glob(pattern, recursive=True)
     files = sorted(
@@ -63,6 +70,7 @@ def glob(args):
 
 
 def grep(args):
+    # 正規表現でファイル群を検索し、マッチした行を最大50件返す
     pattern = re.compile(args["pat"])
     hits = []
     for filepath in globlib.glob(args.get("path", ".") + "/**", recursive=True):
@@ -76,6 +84,7 @@ def grep(args):
 
 
 def bash(args):
+    # シェルコマンドをリアルタイムストリーミングで実行し、出力を返す
     proc = subprocess.Popen(
         args["cmd"], shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -97,7 +106,7 @@ def bash(args):
     return "".join(output_lines).strip() or "(empty)"
 
 
-# --- Tool definitions: (description, schema, function) ---
+# --- ツール定義: (説明, スキーマ, 関数) ---
 
 TOOLS = {
     "read": (
@@ -134,6 +143,7 @@ TOOLS = {
 
 
 def run_tool(name, args):
+    # ツール名でディスパッチし、エラーは文字列で返す
     try:
         return TOOLS[name][2](args)
     except Exception as err:
@@ -141,6 +151,7 @@ def run_tool(name, args):
 
 
 def make_schema():
+    # TOOLS定義からAnthropicのtool_use形式のJSONスキーマを生成する
     result = []
     for name, (description, params, _fn) in TOOLS.items():
         properties = {}
@@ -168,6 +179,7 @@ def make_schema():
 
 
 def call_api(messages, system_prompt):
+    # APIにリクエストを送信し、レスポンスをJSONで返す
     request = urllib.request.Request(
         API_URL,
         data=json.dumps(
@@ -182,6 +194,7 @@ def call_api(messages, system_prompt):
         headers={
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
+            # OpenRouterはBearerトークン、AnthropicはAPIキーヘッダーを使用
             **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": os.environ.get("ANTHROPIC_API_KEY", "")}),
         },
     )
@@ -190,10 +203,12 @@ def call_api(messages, system_prompt):
 
 
 def separator():
+    # ターミナル幅に合わせた区切り線を返す（最大80文字）
     return f"{DIM}{'─' * min(os.get_terminal_size().columns, 80)}{RESET}"
 
 
 def render_markdown(text):
+    # **太字** をANSIボールドに変換する簡易Markdownレンダラー
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
 
 
@@ -209,8 +224,10 @@ def main():
             print(separator())
             if not user_input:
                 continue
+            # /q または exit で終了
             if user_input in ("/q", "exit"):
                 break
+            # /c で会話履歴をリセット
             if user_input == "/c":
                 messages = []
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
@@ -218,7 +235,7 @@ def main():
 
             messages.append({"role": "user", "content": user_input})
 
-            # agentic loop: keep calling API until no more tool calls
+            # エージェントループ: ツール呼び出しがなくなるまでAPIを繰り返し呼ぶ
             while True:
                 response = call_api(messages, system_prompt)
                 content_blocks = response.get("content", [])
@@ -231,12 +248,14 @@ def main():
                     if block["type"] == "tool_use":
                         tool_name = block["name"]
                         tool_args = block["input"]
+                        # 最初の引数の先頭50文字をプレビュー表示
                         arg_preview = str(list(tool_args.values())[0])[:50]
                         print(
                             f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
                         )
 
                         result = run_tool(tool_name, tool_args)
+                        # 結果の先頭60文字をプレビュー表示（複数行の場合は行数も表示）
                         result_lines = result.split("\n")
                         preview = result_lines[0][:60]
                         if len(result_lines) > 1:
@@ -255,6 +274,7 @@ def main():
 
                 messages.append({"role": "assistant", "content": content_blocks})
 
+                # ツール呼び出しがなければループ終了
                 if not tool_results:
                     break
                 messages.append({"role": "user", "content": tool_results})
